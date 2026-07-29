@@ -1,0 +1,20 @@
+# Секреты
+.env
+
+# Артефакты прогонов
+output/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ОС/редакторы
+.DS_Store
+.idea/
+.vscode/
