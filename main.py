@@ -49,6 +49,8 @@ def _parse_args(argv) -> argparse.Namespace:
     p.add_argument("--idea", help="Текст идеи продукта (1–2 предложения + опц. ограничения).")
     p.add_argument("--idea-file", help="Файл с текстом идеи ('-' — читать из stdin).")
     p.add_argument("--output", "-o", default="output", help="Каталог для артефактов (по умолчанию: output).")
+    p.add_argument("--backend", choices=("api", "cli"),
+                   help="Бэкенд: api (Anthropic SDK, нужен ключ) или cli (локальный claude, без ключа).")
     p.add_argument("--model", help=f"ID модели Claude (по умолчанию: {DEFAULT_MODEL}).")
     p.add_argument("--effort", choices=VALID_EFFORTS, help="Усилие рассуждения (по умолчанию: high).")
     p.add_argument("--max-tokens", type=int, help="Лимит токенов ответа на ноду (по умолчанию: 32000).")
@@ -141,11 +143,16 @@ def _print_summary(cfg: Config, result) -> None:
           f"токены: {_fmt_tokens(total_in)} вход / {_fmt_tokens(total_out)} выход"
           + (f" · веб-поиск ×{searches}" if searches else ""))
 
-    price = PRICES.get(cfg.model)
-    if price:
-        cost = (total_in * price[0] + total_out * price[1]) / 1_000_000
-        note = " (+ веб-поиск)" if searches else ""
-        print(f"Оценка стоимости токенов ({cfg.model}): ≈ ${cost:.3f}{note}")
+    actual_cost = sum(r.cost_usd for r in result.results.values())
+    if actual_cost > 0:
+        # CLI-бэкенд отдаёт реальную стоимость по каждой ноде.
+        print(f"Стоимость (по данным CLI): ≈ ${actual_cost:.3f}")
+    else:
+        price = PRICES.get(cfg.model)
+        if price:
+            cost = (total_in * price[0] + total_out * price[1]) / 1_000_000
+            note = " (+ веб-поиск)" if searches else ""
+            print(f"Оценка стоимости токенов ({cfg.model}): ≈ ${cost:.3f}{note}")
 
     if result.failed:
         print(f"\n⚠ Упавшие ноды: {', '.join(result.failed)}")
@@ -182,9 +189,12 @@ def main(argv=None) -> int:
         print("Нужна идея продукта: передайте --idea \"...\" или --idea-file PATH.", file=sys.stderr)
         return 2
 
-    print(f"Модель: {cfg.model} · усилие: {cfg.effort} · "
-          f"мышление: {'adaptive' if cfg.thinking else 'off'} · "
-          f"нод: {len(skills)}\n")
+    if cfg.backend == "cli":
+        head = f"Бэкенд: cli (локальный claude) · модель: {cfg.model} · нод: {len(skills)}"
+    else:
+        head = (f"Бэкенд: api · модель: {cfg.model} · усилие: {cfg.effort} · "
+                f"мышление: {'adaptive' if cfg.thinking else 'off'} · нод: {len(skills)}")
+    print(head + "\n")
     _print_plan(skills, plan)
 
     if args.dry_run:

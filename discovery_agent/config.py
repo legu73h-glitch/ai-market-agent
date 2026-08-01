@@ -12,6 +12,7 @@ DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
 DEFAULT_MAX_TOKENS = 32000
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+VALID_BACKENDS = ("api", "cli")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,6 +47,12 @@ class Config:
     output_dir: Path = field(default_factory=lambda: Path("output"))
     max_workers: int = 4
     web_search_max_uses: int = 8
+    # Бэкенд исполнения нод: "api" (Anthropic SDK, нужен ключ) или
+    # "cli" (локальный `claude` CLI, ключ не нужен).
+    backend: str = "api"
+    cli_bin: str = field(default_factory=lambda: os.environ.get("CLAUDE_CODE_EXECPATH") or "claude")
+    cli_timeout: int = 900
+    cli_retries: int = 3  # повторы CLI-ноды при временных сбоях (TLS/сеть/overload)
 
     @classmethod
     def from_env_and_args(cls, args) -> "Config":
@@ -57,9 +64,12 @@ class Config:
         cfg = cls()
         cfg.model = os.environ.get("DISCOVERY_MODEL", cfg.model)
         cfg.effort = os.environ.get("DISCOVERY_EFFORT", cfg.effort)
+        cfg.backend = os.environ.get("DISCOVERY_BACKEND", cfg.backend)
         if os.environ.get("DISCOVERY_MAX_TOKENS"):
             cfg.max_tokens = int(os.environ["DISCOVERY_MAX_TOKENS"])
 
+        if getattr(args, "backend", None):
+            cfg.backend = args.backend
         if getattr(args, "model", None):
             cfg.model = args.model
         if getattr(args, "effort", None):
@@ -77,6 +87,10 @@ class Config:
         return cfg
 
     def validate(self) -> None:
+        if self.backend not in VALID_BACKENDS:
+            raise ValueError(
+                f"backend должен быть одним из {VALID_BACKENDS}, получено: {self.backend!r}"
+            )
         if self.effort not in VALID_EFFORTS:
             raise ValueError(
                 f"effort должен быть одним из {VALID_EFFORTS}, получено: {self.effort!r}"

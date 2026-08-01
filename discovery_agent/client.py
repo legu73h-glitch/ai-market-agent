@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import time
 from dataclasses import dataclass, field
 
@@ -16,13 +18,20 @@ from .skills import Skill
 # Сколько раз готовы продолжить турн после pause_turn (серверный web search).
 MAX_CONTINUATIONS = 6
 
+# Инструменты, которые нода не должна трогать в CLI-бэкенде (чистая генерация).
+_CLI_BASE_DISALLOWED = [
+    "Bash", "Edit", "MultiEdit", "Write", "Read", "Glob", "Grep",
+    "Task", "TodoWrite", "NotebookEdit", "BashOutput", "KillShell", "SlashCommand",
+]
+
 PREAMBLE = """Ты — нода автономного discovery-конвейера продакт-менеджера. Работаешь строго в пайплайн-режиме.
 
 Правила конвейера:
 1. Не задавай вопросов и ничего не уточняй. Пробелы во входных данных закрывай обоснованными допущениями с пометкой [assumption].
 2. Строгий выход: верни ТОЛЬКО целевой артефакт по шаблону из инструкции ниже — без вводных фраз до и без комментариев после.
-3. Единый предмет: название продукта и формулировку проблемы бери из входных артефактов без искажений.
-4. Язык — русский.
+3. Не оборачивай весь ответ в код-блок с тройными кавычками (```). Пиши markdown напрямую.
+4. Единый предмет: название продукта и формулировку проблемы бери из входных артефактов без искажений.
+5. Язык — русский.
 
 Следуй разделу «Режим в пайплайне (автономный)» своей инструкции. Полная инструкция ниже.
 
@@ -43,11 +52,18 @@ class NodeResult:
     web_searches: int = 0
     elapsed: float = 0.0
     truncated: bool = False
+    cost_usd: float = 0.0  # заполняется CLI-бэкендом (для API оценивается в main)
 
 
 def make_client(config):
-    """Создаёт клиент Anthropic. Ключ берётся из ANTHROPIC_API_KEY / профиля."""
-    import anthropic  # локальный импорт: --dry-run работает без установленного SDK
+    """Готовит клиент для выбранного бэкенда.
+
+    backend="api"  → клиент Anthropic (ключ из ANTHROPIC_API_KEY / профиля).
+    backend="cli"  → None (ноды исполняет локальный `claude` CLI, ключ не нужен).
+    """
+    if getattr(config, "backend", "api") == "cli":
+        return None
+    import anthropic  # локальный импорт: --dry-run/CLI работают без установленного SDK
 
     return anthropic.Anthropic()
 
@@ -94,8 +110,33 @@ def _count_web_searches(msg) -> int:
     )
 
 
+def strip_code_fence(text: str) -> str:
+    """Снимает единственную внешнюю обёртку ```…``` (если модель обернула весь ответ).
+
+    Оставляет как есть, если внешней обёртки нет или внутри есть другие ```-блоки
+    (тогда снятие первой/последней строки исказило бы контент).
+    """
+    t = (text or "").strip()
+    lines = t.splitlines()
+    if len(lines) >= 2 and lines[0].lstrip().startswith("```") and lines[-1].strip() == "```":
+        fences = sum(1 for ln in lines if ln.lstrip().startswith("```"))
+        if fences == 2:
+            return "\n".join(lines[1:-1]).strip()
+    return t
+
+
 def run_node(client, config, skill: Skill, inputs: dict[str, str]) -> NodeResult:
-    """Прогоняет ноду и возвращает NodeResult с текстом артефакта и метриками."""
+    """Диспетчер: исполняет ноду выбранным бэкендом (api | cli) и чистит артефакт."""
+    if getattr(config, "backend", "api") == "cli":
+        result = run_node_cli(config, skill, inputs)
+    else:
+        result = run_node_api(client, config, skill, inputs)
+    result.text = strip_code_fence(result.text)
+    return result
+
+
+def run_node_api(client, config, skill: Skill, inputs: dict[str, str]) -> NodeResult:
+    """Прогоняет ноду через Anthropic Messages API (стриминг + pause_turn)."""
     t0 = time.monotonic()
     system = build_system(skill)
     messages = [{"role": "user", "content": build_user_message(skill, inputs)}]
@@ -165,4 +206,117 @@ def run_node(client, config, skill: Skill, inputs: dict[str, str]) -> NodeResult
         web_searches=searches,
         elapsed=time.monotonic() - t0,
         truncated=truncated,
+    )
+
+
+# Признаки временных сбоев CLI, при которых повтор оправдан.
+_CLI_TRANSIENT = (
+    "self-signed certificate", "unable to connect", "connection error",
+    "econnreset", "socket hang up", "overloaded", "rate limit",
+    "timeout", "timed out", "502", "503", "529", "internal server error",
+)
+
+
+def _is_transient(message: str) -> bool:
+    low = message.lower()
+    return any(marker in low for marker in _CLI_TRANSIENT)
+
+
+def run_node_cli(config, skill: Skill, inputs: dict[str, str]) -> NodeResult:
+    """Прогоняет ноду через локальный `claude` CLI (ключ Anthropic не нужен).
+
+    Тот же системный промпт и то же сообщение, что и в API-бэкенде. Ноде
+    market-research разрешаются веб-инструменты, остальным — чистая генерация.
+    Временные сбои (TLS/сеть/overload) повторяются с экспоненциальной паузой.
+    """
+    t0 = time.monotonic()
+    retries = max(1, getattr(config, "cli_retries", 3))
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = _cli_attempt(config, skill, inputs)
+            result.elapsed = time.monotonic() - t0
+            return result
+        except RuntimeError as exc:
+            last_exc = exc
+            if attempt < retries and _is_transient(str(exc)):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+def _cli_attempt(config, skill: Skill, inputs: dict[str, str]) -> NodeResult:
+    """Один заход CLI-ноды (без повторов)."""
+    system = build_system(skill)
+    user = build_user_message(skill, inputs)
+    web = "web_search" in skill.tools
+
+    cmd = [
+        config.cli_bin, "-p", user,
+        "--system-prompt", system,
+        "--model", config.model,
+        "--output-format", "json",
+        "--setting-sources", "user",
+    ]
+    disallowed = list(_CLI_BASE_DISALLOWED)
+    if web:
+        cmd += ["--allowedTools", "WebSearch", "WebFetch"]
+    else:
+        disallowed += ["WebSearch", "WebFetch"]
+    cmd += ["--disallowedTools", *disallowed]
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=config.cli_timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"claude CLI: таймаут {config.cli_timeout}s") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Не найден claude CLI ({config.cli_bin!r}). Установите Claude Code "
+            f"или используйте --backend api с ключом ANTHROPIC_API_KEY."
+        ) from exc
+
+    out = (proc.stdout or "").strip()
+    text = ""
+    in_tok = out_tok = searches = 0
+    cost = 0.0
+    stop_reason = ""
+
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        data = None
+
+    if data is not None:
+        text = (data.get("result") or "").strip()
+        usage = data.get("usage") or {}
+        in_tok = int(usage.get("input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        searches = int((usage.get("server_tool_use") or {}).get("web_search_requests") or 0)
+        cost = float(data.get("total_cost_usd") or 0.0)
+        stop_reason = data.get("stop_reason") or ("error" if data.get("is_error") else "end_turn")
+        if data.get("is_error"):
+            raise RuntimeError(f"claude CLI вернул ошибку: {text or data.get('subtype')}")
+    else:
+        text = out
+        stop_reason = "end_turn"
+
+    if not text:
+        err = (proc.stderr or "").strip()[:400]
+        raise RuntimeError(f"claude CLI (rc={proc.returncode}) без результата: {err}")
+
+    return NodeResult(
+        name=skill.name,
+        text=text.strip(),
+        output_names=list(skill.outputs),
+        stop_reason=stop_reason,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        web_searches=searches,
+        elapsed=0.0,  # проставляется обёрткой run_node_cli
+        truncated=(stop_reason == "max_tokens"),
+        cost_usd=cost,
     )

@@ -39,23 +39,37 @@ idea
 | 6 | `wireframe-spec` | story_map | `wireframes` | — |
 | 7 | `persona-interview` | personas + brief | `interview_report` | — |
 
+## Два бэкенда исполнения
+
+Ноды можно исполнять двумя способами — оба дают одинаковые промпты и артефакты:
+
+| `--backend` | Чем считает | Нужен ключ | Веб-поиск |
+|-------------|-------------|-----------|-----------|
+| `api` (по умолчанию) | Anthropic Messages API (SDK) | да, `ANTHROPIC_API_KEY` | серверный `web_search` + `pause_turn` |
+| `cli` | локальный `claude` CLI (Claude Code) | нет | штатный WebSearch клиента |
+
+Бэкенд `cli` удобен, когда установлен Claude Code и не хочется заводить
+отдельный ключ; `api` — основной путь для продакшена и интеграций.
+
 ## Быстрый старт
 
 ```bash
 # 1. Зависимости
-pip install -r requirements.txt
+pip install -r requirements.txt      # или: pip install -e .  → команда `discovery`
 
-# 2. Ключ Anthropic (любой из вариантов)
+# 2a. Бэкенд api — ключ Anthropic (любой из вариантов)
 cp .env.example .env        # и впишите ANTHROPIC_API_KEY
 # либо: export ANTHROPIC_API_KEY=sk-ant-...
 # либо: ant auth login       (профиль подхватится автоматически)
-
-# 3. Запуск
 python main.py --idea "Сервис подписки на здоровые обеды для офисов"
+
+# 2b. Бэкенд cli — без ключа, через локальный claude (Claude Code)
+python main.py --backend cli --idea "Сервис подписки на здоровые обеды для офисов"
 ```
 
 Артефакты появятся в `output/`: по файлу на каждый (`brief.md`, `market.md`, …)
-плюс сводный `discovery-package.md` с оглавлением.
+плюс сводный `discovery-package.md` с оглавлением. Готовый пример прогона —
+в [`examples/nutribox/`](examples/nutribox/).
 
 Посмотреть план без вызовов API (и без ключа):
 
@@ -92,6 +106,7 @@ python main.py --list-skills
 |------|-----------|--------------|
 | `--idea TEXT` / `--idea-file PATH` | Идея продукта (`-` — из stdin) | — |
 | `--output, -o DIR` | Каталог для артефактов | `output` |
+| `--backend {api,cli}` | Бэкенд исполнения нод | `api` |
 | `--model ID` | ID модели Claude | `claude-opus-5` |
 | `--effort {low,medium,high,xhigh,max}` | Усилие рассуждения | `high` |
 | `--max-tokens N` | Лимит токенов ответа на ноду | `32000` |
@@ -103,7 +118,7 @@ python main.py --list-skills
 | `--list-skills` | Список скиллов и выход | — |
 
 Те же значения можно задать через окружение/`.env`: `DISCOVERY_MODEL`,
-`DISCOVERY_EFFORT`, `DISCOVERY_MAX_TOKENS`.
+`DISCOVERY_EFFORT`, `DISCOVERY_MAX_TOKENS`, `DISCOVERY_BACKEND`.
 
 ## Как это устроено
 
@@ -124,8 +139,11 @@ python main.py --list-skills
 - **Web search + pause_turn.** `market-research` подключает серверный
   инструмент `web_search`. Серверный tool-loop может вернуть `pause_turn` —
   оркестратор дозапрашивает продолжение, пока модель не завершит отчёт.
-- **Стриминг.** Каждый вызов идёт через `messages.stream(...)` +
+- **Стриминг.** В `api`-бэкенде каждый вызов идёт через `messages.stream(...)` +
   `get_final_message()` — защита от таймаутов на длинных ответах.
+- **Два бэкенда.** `client.py` диспетчеризует ноду по `--backend`: `api`
+  (Anthropic SDK) или `cli` (subprocess `claude -p` с тем же системным промптом;
+  веб-ноде разрешаются WebSearch/WebFetch, остальным — чистая генерация).
 - **Устойчивость.** Упавшая нода не роняет весь прогон: независимые ветки
   доходят до конца, зависимые помечаются пропущенными, а всё уже собранное
   сохраняется на диск.
@@ -180,16 +198,18 @@ python -m unittest tests.test_offline -v
 
 ```
 ai-market-agent/
-├── main.py                    # CLI
+├── main.py                    # CLI (точка входа `discovery`)
 ├── discovery_agent/
-│   ├── config.py              # конфиг (модель, усилие, пути, .env)
+│   ├── config.py              # конфиг (бэкенд, модель, усилие, пути, .env)
 │   ├── skills.py              # загрузка скиллов + разбор front-matter
-│   ├── client.py              # запуск ноды: промпт, web search, pause_turn, стриминг
+│   ├── client.py              # запуск ноды: api (SDK) и cli (claude) бэкенды
 │   ├── pipeline.py            # граф зависимостей + параллельный исполнитель
 │   └── artifacts.py           # сохранение артефактов и сводного пакета
 ├── skills/                    # SKILL.md всех нод (+ examples.md)
+├── examples/nutribox/         # готовый пример прогона (реальные артефакты)
 ├── tests/test_offline.py      # оффлайн-проверка конвейера
 ├── WORKFLOW.md                # исходная схема связки нод
+├── pyproject.toml             # установка `pip install -e .` → команда `discovery`
 ├── requirements.txt
 └── .env.example
 ```

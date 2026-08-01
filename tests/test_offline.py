@@ -20,6 +20,7 @@ from unittest import mock
 
 from discovery_agent import build_plan, load_skills, run_pipeline
 from discovery_agent.artifacts import build_package, save_artifacts
+from discovery_agent.client import strip_code_fence
 from discovery_agent.config import Config
 from discovery_agent.skills import PIPELINE_SKILLS
 
@@ -124,6 +125,15 @@ class PipelineOfflineTest(unittest.TestCase):
         for call in tool_calls:
             self.assertEqual(call["tools"][0]["type"], "web_search_20260209")
         self.assertTrue(plain_calls)
+
+    def test_strip_code_fence(self):
+        # Внешняя обёртка снимается.
+        self.assertEqual(strip_code_fence("```markdown\n# H\n\ntext\n```"), "# H\n\ntext")
+        # Без обёртки — без изменений.
+        self.assertEqual(strip_code_fence("# H\n\ntext"), "# H\n\ntext")
+        # Есть внутренние ```-блоки — не трогаем (иначе исказим).
+        s = "```markdown\n# H\n```\ncode\n```\n```"
+        self.assertEqual(strip_code_fence(s), s.strip())
 
     def test_artifacts_written(self):
         fake = _FakeClient()
